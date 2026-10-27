@@ -1,0 +1,82 @@
+# GCP Marketplace deployer schema — the form a buyer fills in after clicking "Configure & Deploy"
+# on the GKE Marketplace listing page. Lives at /data/schema.yaml INSIDE the deployer image.
+#
+# Structure follows schemaVersion v2 (used by all click-to-deploy apps):
+#   - top-level x-google-marketplace block: schemaVersion, applicationApiVersion, publishedVersion,
+#     publishedVersionMetadata, images
+#   - properties: buyer-facing form fields; names are dotted helm paths passed verbatim as --set keys
+#     by expand_config.py (deployer_helm). A camelCase name sets the wrong helm key.
+x-google-marketplace:
+    schemaVersion: v2
+    applicationApiVersion: v1beta1
+    publishedVersion: '$TAG'
+    publishedVersionMetadata:
+        releaseNote: 'Security update: patches critical vulnerabilities and confines default file writes per user.'
+        releaseTypes:
+            - Security
+        recommended: true
+    images:
+        # Key maps to sub-path under __image_repo_prefix__ (the GAR repo root).
+        # 'windyflo/windyflo' → us-docker.pkg.dev/windyflo-public/windyflo-marketplace/windyflo/windyflo
+        windyflo/windyflo:
+            properties:
+                image.full:
+                    type: FULL
+        # Every image the chart deploys must be declared: Google copies declared images into its own
+        # registry and rewrites these values; undeclared images stay in our private repo and 403.
+        windyflo/postgresql:
+            properties:
+                data.postgres.imageName:
+                    type: FULL
+        windyflo/minio:
+            properties:
+                data.minio.image:
+                    type: FULL
+        windyflo/redis:
+            properties:
+                data.redis.image:
+                    type: FULL
+        # BYOL listing: no usage metering, so the ubbagent image is NOT declared (Google scans and copies
+        # every declared image). The usage-based variant is schema-paid.yaml, used automatically when
+        # MARKETPLACE_VALUES_FILE is the -paid profile.
+
+properties:
+    # ---- required substitutable parameters (GCP Marketplace mandates these two) ----
+    name:
+        type: string
+        x-google-marketplace:
+            type: NAME
+    namespace:
+        type: string
+        x-google-marketplace:
+            type: NAMESPACE
+
+    # ---- buyer-facing config ----
+    # Property names are dotted helm paths — expand_config.py passes them verbatim as --set keys.
+    ingress.host:
+        type: string
+        title: Public domain (ingress host)
+        description: >-
+            The DNS name you'll point at the cluster's load balancer, e.g. windyflo.yourcompany.com.
+            You create the DNS A-record after deploy.
+        default: windyflo.example.com
+        pattern: '^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$'
+    main.autoscaling.maxReplicas:
+        type: integer
+        title: Max app replicas (autoscale ceiling)
+        description: The horizontal pod autoscaler scales the app between 2 and this number based on load.
+        default: 8
+        minimum: 2
+        maximum: 16
+    worker.autoscaling.maxReplicas:
+        type: integer
+        title: Max worker replicas (autoscale ceiling)
+        description: The horizontal pod autoscaler scales workers between 2 and this number based on load.
+        default: 8
+        minimum: 2
+        maximum: 16
+
+required:
+    - name
+    - namespace
+    - ingress.host

@@ -1,0 +1,153 @@
+# GCP Marketplace profile — PAID listing (usage-based pricing). Same product type and deployer flow
+# as the free/BYOL values-marketplace-gcp.yaml; what changes is the pricing plan in the Producer
+# Portal plus the ubbagent usage-reporting sidecar configured below.
+#
+# HOW GCP BILLING WORKS HERE — a third shape, different from both AWS and Azure:
+#   GCP bills from usage the DEPLOYMENT reports to Google Service Control. Google's usage-based
+#   billing agent (ubbagent) runs as a sidecar on the main pod and does that reporting; the chart
+#   mounts the Marketplace-provisioned reporting Secret for it (credentials arrive as a Secret, NOT
+#   via Workload Identity).
+#
+#   Consequence — the important one: GCP supports usage REPORTING only. Google documents NO way for an
+#   in-cluster app to verify entitlement, so an unpaid or lapsed GCP deployment CANNOT be blocked from
+#   inside the cluster. (The reporting Secret's `entitlement-id` field is an identifier only; Google's
+#   own docs call it "generally unused". Entitlement APIs exist solely under the seller-hosted SaaS
+#   Procurement API, which does not apply to a buyer-deployed Kubernetes app.) LICENSE_PROVIDER=gcp
+#   below therefore only warns when the reporting credentials are missing — see
+#   packages/server/src/license/gcp.ts.
+#
+#   Pricing-model note: GCP has no per-node/per-core plan type for classic Kubernetes apps. The
+#   documented models are Free, BYOL and usage-based (time, data, storage-time, or a custom metric).
+#   If per-core pricing is wanted, that needs a custom metric here or a migration to the newer
+#   "Terraform Kubernetes app" product type, whose usage-based model prices on GKE pod vCPU/memory.
+#
+# Also unresolved (flagged, not guessed): `ubbagent` is still the documented approach and carries no
+# deprecation notice, but its upstream repo is low-activity — documented is not the same as
+# maintained. Confirm before relying on it long-term.
+#
+# Differs from values-gcp.yaml (which assumes YOUR ops team + helmfile + Vault):
+#   • images point at Artifact Registry (the publisher's registry) — required, no ghcr.io/quay.io/docker.io
+#   • secrets AUTO-GENERATE — no Vault, nothing for the buyer to fill in beyond the deployer form
+#   • ExternalSecrets OFF — the in-chart Secret is used instead
+#   • gcpMarketplace.enabled: true — renders the Application CR the Marketplace UI reads
+#
+# Before packaging:
+#   1. run deploy/marketplace/gcp/mirror-images-to-gar.sh to populate Artifact Registry
+#   2. replace EVERY us-docker.pkg.dev/windyflo-public/windyflo-marketplace below with your repo path (e.g. us-docker.pkg.dev/my-project/windyflo-public)
+#   3. tag every mirrored image with BOTH the release-track tag and the exact version (GCP requirement)
+#   4. stamp the com.googleapis.cloudmarketplace.product.service.name annotation on every image
+#      manifest (see mirror script — this is GCP's Jan-2025 requirement, no Azure/ACR equivalent)
+
+# ---- primary app image: from the publisher's Artifact Registry (no ghcr.io) ----
+# Base values.yaml's ghcr.io/hamada-labs/windyflo digest is a CONFIRMED BROKEN build (see
+# deploy/marketplace/images.txt) — not a safe inherited value, don't rely on it. Source to mirror
+# is ghcr.io/hamada-labs/windyflo:modu.windyflo (images.txt), verified working 2026-08-12. Tag below
+# is the version-tag mirror-images-to-gar.sh writes to GAR (images.txt's version-tag column).
+image:
+    repository: us-docker.pkg.dev/windyflo-public/windyflo-marketplace/windyflo/windyflo
+    tag: '3.1.4'
+    digest: 'sha256:c840b7f86c1244c51a797ce005094a24dcf07e6aa7783ec3f29459b6dc6c30d1' # annotated 3.1.4 GAR manifest
+    full: 'us-docker.pkg.dev/windyflo-public/windyflo-marketplace/windyflo/windyflo@sha256:c840b7f86c1244c51a797ce005094a24dcf07e6aa7783ec3f29459b6dc6c30d1'
+    pullPolicy: IfNotPresent
+
+gcpMarketplace:
+    enabled: true
+    # REPLACE_ME placeholders keep this profile renderable (so the 11-profile regression stays green)
+    # while making it impossible to ship them by accident: build-deployer.sh refuses to package a
+    # deployer whose values still contain REPLACE_ME. Both come from the Producer Portal listing and
+    # are emitted into the required marketplace.cloud.google.com/deploy-info annotation.
+    partnerId: windyflo-public
+    productId: windyflo.endpoints.windyflo-public.cloud.goog
+    # Set by build-deployer.sh from $VERSION; must equal schema.yaml's publishedVersion exactly.
+    publishedVersion: ''
+
+    # ---- usage reporting (this is what makes the listing PAID) ----
+    # GCP bills the buyer from usage this agent reports to Google Service Control. serviceName and
+    # metricName are minted by the Marketplace team when the pricing model is submitted — they are not
+    # free-form. reportingSecretName must match the deployer's REPORTING_SECRET schema.yaml parameter
+    # (Marketplace creates that Secret in the namespace before the app deploys).
+    # REPLACE_ME here is load-bearing: build-deployer.sh refuses to package while it is present.
+    ubbagent:
+        enabled: true
+        image: 'us-docker.pkg.dev/windyflo-public/windyflo-marketplace/windyflo/ubbagent:3.1.3' # schema.yaml (type FULL) swaps in Google's per-deployment copy
+        # Overridden by the REPORTING_SECRET-typed deployer schema property.
+        reportingSecretName: reporting-secret
+        serviceName: windyflo.endpoints.windyflo-public.cloud.goog
+        metricName: instance_hours # Producer Portal > Pricing > metric ID; reported as <serviceName>/instance_hours; heartbeat = 1 per 3600s = 1 hour
+
+config:
+    extra:
+        # Selects packages/server/src/license/gcp.ts, which checks the reporting Secret is readable and
+        # WARNS if not. It cannot enforce payment — GCP exposes no entitlement signal for
+        # buyer-self-hosted Kubernetes apps, only usage reporting.
+        LICENSE_PROVIDER: 'gcp'
+
+# ---- secrets: self-contained, zero buyer input ----
+secrets:
+    autoGenerate: true # generate + persist strong random secrets at install (see templates/secret.yaml)
+
+externalSecrets:
+    enabled: false # no Vault dependency on the marketplace path
+
+# ---- data layer: GAR images + HA sizing ----
+# NOTE: the instances/storageSize/replicaCount/autoscaling values below intentionally MIRROR
+# values-gcp.yaml. Kept as a separate, self-contained file (not layered via -f) so the GCP deployer
+# image's single HELM_VALUES (see deployer/Dockerfile) stays self-contained — see docs/gcp-marketplace-listing.md.
+# If you change HA/sizing defaults here, update values-gcp.yaml too (and vice versa) or the
+# marketplace and direct-deploy paths will silently drift.
+data:
+    # Plain StatefulSets, no operator CRDs / Helm hooks: the Marketplace deployer is single-namespace
+    # and rejects install hooks, and a stock GKE cluster has no CNPG / MinIO operator. See values.yaml.
+    # Image refs below are placeholders for schema.yaml, which swaps in Google's per-deployment copies
+    # (tag = publishedVersion). Built from deploy/marketplace/gcp/images/*.
+    plain: true
+    postgres:
+        imageName: us-docker.pkg.dev/windyflo-public/windyflo-marketplace/windyflo/postgresql:3.1.3
+        instances: 1
+        storageSize: 50Gi
+        storageClass: premium-rwo # GCP PD-SSD CSI
+        synchronous: { enabled: false }
+        pooler: { enabled: false }
+        backup: { enabled: false }
+    minio:
+        image: us-docker.pkg.dev/windyflo-public/windyflo-marketplace/windyflo/minio:3.1.3
+        mode: standalone
+        servers: 1
+        volumesPerServer: 1
+        storageSize: 100Gi
+        storageClass: premium-rwo
+    redis:
+        embedded: true
+        subchart: false # Bitnami subchart off; plain-redis.yaml runs the patched official image
+        image: us-docker.pkg.dev/windyflo-public/windyflo-marketplace/windyflo/redis:3.1.3
+
+# ---- Kyverno cosign verifyImages glob must match the GAR image, not ghcr ----
+verifyImages:
+    imageGlobs: 'us-docker.pkg.dev/windyflo-public/windyflo-marketplace/windyflo/windyflo*'
+
+# ---- app sizing (buyer can scale via the deployer schema.yaml form) ----
+main:
+    replicaCount: 2
+    autoscaling: { enabled: true, minReplicas: 2, maxReplicas: 8 }
+    podDisruptionBudget: { enabled: true, minAvailable: 1 }
+worker:
+    replicaCount: 2
+    autoscaling: { enabled: true, minReplicas: 2, maxReplicas: 8 }
+    podDisruptionBudget: { enabled: true, minAvailable: 1 }
+
+clusterIssuer:
+    enabled: false
+
+ingress:
+    host: windyflo.example.com # OVERRIDDEN by the buyer via the deployer schema.yaml
+    tls:
+        enabled: false # no cert-manager on stock GKE; see values-marketplace-gcp.yaml
+
+metrics:
+    # OFF by default: ServiceMonitor is a CRD from the Prometheus Operator, which is not a
+    # disclosed buyer prerequisite. Buyers who already run kube-prometheus-stack can flip this
+    # to true in their own values.yaml.
+    serviceMonitor: { enabled: false }
+
+networkPolicy:
+    enabled: true

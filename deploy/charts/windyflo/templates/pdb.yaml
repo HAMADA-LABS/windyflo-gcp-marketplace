@@ -1,0 +1,37 @@
+{{- if .Values.main.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "windyflo.fullname" . }}-main
+  labels:
+    {{- include "windyflo.labels" . | nindent 4 }}
+spec:
+  {{- if hasKey .Values.main.podDisruptionBudget "maxUnavailable" }}
+  maxUnavailable: {{ .Values.main.podDisruptionBudget.maxUnavailable }}
+  {{- else }}
+  minAvailable: {{ .Values.main.podDisruptionBudget.minAvailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "windyflo.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: main
+{{- end }}
+{{- if .Values.worker.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "windyflo.fullname" . }}-worker
+  labels:
+    {{- include "windyflo.labels" . | nindent 4 }}
+spec:
+  {{- if hasKey .Values.worker.podDisruptionBudget "maxUnavailable" }}
+  maxUnavailable: {{ .Values.worker.podDisruptionBudget.maxUnavailable }}
+  {{- else }}
+  minAvailable: {{ .Values.worker.podDisruptionBudget.minAvailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "windyflo.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+{{- end }}

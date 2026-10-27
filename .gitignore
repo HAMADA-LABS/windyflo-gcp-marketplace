@@ -1,0 +1,3 @@
+deploy/marketplace/gcp/deployer/chart/
+deploy/marketplace/gcp/deployer/schema.yaml
+*.tgz

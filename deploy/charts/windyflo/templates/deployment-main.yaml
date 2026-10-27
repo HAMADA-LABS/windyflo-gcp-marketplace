@@ -1,0 +1,91 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "windyflo.fullname" . }}-main
+  labels:
+    {{- include "windyflo.labels" . | nindent 4 }}
+    app.kubernetes.io/component: main
+spec:
+  {{- if not .Values.main.autoscaling.enabled }}
+  replicas: {{ .Values.main.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "windyflo.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: main
+  template:
+    metadata:
+      labels:
+        {{- include "windyflo.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: main
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Roll pods when config/secret content changes
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "windyflo.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: main
+          image: {{ include "windyflo.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: {{ toYaml .Values.main.command | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.main.port }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "windyflo.configName" . }}
+            - secretRef:
+                name: {{ include "windyflo.secretName" . }}
+          env:
+            {{- if and .Values.data.redis.embedded .Values.redis.auth.enabled }}
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: windyflo-redis-auth
+                  key: redis-password
+            {{- end }}
+          livenessProbe:
+            {{- toYaml .Values.main.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.main.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.main.resources | nindent 12 }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        {{- /* GCP Marketplace paid listing only: usage-reporting sidecar. */}}
+        {{- if .Values.gcpMarketplace.ubbagent.enabled }}
+        {{- include "windyflo.ubbagentContainer" . | nindent 8 }}
+        {{- end }}
+      {{- if .Values.gcpMarketplace.ubbagent.enabled }}
+      volumes:
+        {{- include "windyflo.ubbagentVolumes" . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.main.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.main.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.main.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.main.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

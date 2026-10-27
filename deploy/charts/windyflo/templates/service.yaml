@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "windyflo.fullname" . }}-main
+  labels:
+    {{- include "windyflo.labels" . | nindent 4 }}
+    app.kubernetes.io/component: main
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "windyflo.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: main
+{{- if .Values.collab.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "windyflo.fullname" . }}-collab
+  labels:
+    {{- include "windyflo.labels" . | nindent 4 }}
+    app.kubernetes.io/component: collab
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "windyflo.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: collab
+{{- end }}

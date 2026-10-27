@@ -1,0 +1,90 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- /*
+NetworkPolicy (A15). Two policies:
+
+  1. default-deny-ingress — selects EVERY pod in the windyflo namespace (empty podSelector) and
+     permits no ingress. This is the baseline isolation: nothing can reach a windyflo-ns pod unless
+     a later policy explicitly allows it (NetworkPolicies are additive — allows union together).
+
+  2. allow-windyflo-app-ingress — opens ONLY what the app needs:
+       - ingress-nginx namespace → main/collab/worker HTTP ports (web traffic),
+       - monitoring namespace    → main metrics + worker healthz (Prometheus scrape),
+       - same-namespace pods      → app↔app and app↔data-layer (CNPG/MinIO/Redis live here too).
+
+EGRESS is intentionally left unrestricted: the app must reach the in-cluster data layer, the
+cluster DNS, the K8s API (ESO), and (connected envs) SMTP / OAuth / object-store endpoints whose
+addresses vary per environment. Locking egress down belongs to a per-env overlay, not the chart
+default. Default-deny INGRESS is the high-value control and is what PSS-adjacent audits check.
+
+Requires a CNI that enforces NetworkPolicy (k3d/flannel, Calico, Cilium, cloud CNIs all do).
+*/ -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "windyflo.fullname" . }}-default-deny-ingress
+  labels:
+    {{- include "windyflo.labels" . | nindent 4 }}
+spec:
+  podSelector: {}        # all pods in this namespace
+  policyTypes:
+    - Ingress
+  # no `ingress:` rules → deny all inbound
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "windyflo.fullname" . }}-allow-app-ingress
+  labels:
+    {{- include "windyflo.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "windyflo.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # Web traffic from the ingress controller → main/collab (3000) and worker healthz (5566).
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.ingressControllerNamespace }}
+      ports:
+        - { protocol: TCP, port: {{ .Values.main.port }} }
+        - { protocol: TCP, port: {{ .Values.worker.port }} }
+    # Prometheus scrape from the monitoring namespace → main metrics + worker /healthz.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.monitoringNamespace }}
+      ports:
+        - { protocol: TCP, port: {{ .Values.main.port }} }
+        - { protocol: TCP, port: {{ .Values.worker.port }} }
+    # Intra-namespace: app pods talk to each other and to the embedded data layer (same ns).
+    - from:
+        - podSelector: {}
+---
+{{/*
+  allow-intra-namespace — BLOCKER FIX. `allow-app-ingress` above only selects the APP pods
+  (windyflo.selectorLabels), so it re-opens ingress to main/collab/worker only. The embedded data
+  layer — CNPG Postgres (labels cnpg.io/*), the MinIO Tenant (v1.min.io/tenant), and the bitnami
+  Redis pods — match NONE of those labels, so they stayed under `default-deny-ingress` with no allow
+  and the app's connections to Postgres:5432 / Redis:6379 / MinIO:9000 (and the bootstrap Job) were
+  silently dropped on every profile that enables NetworkPolicy (all cloud/prod/airgap/marketplace).
+  This policy selects EVERY pod in the namespace and permits ingress from any pod in the SAME
+  namespace — restoring app↔data-layer traffic while keeping cross-namespace default-deny intact.
+*/ -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "windyflo.fullname" . }}-allow-intra-namespace
+  labels:
+    {{- include "windyflo.labels" . | nindent 4 }}
+spec:
+  podSelector: {}        # all pods in this namespace (app + data layer)
+  policyTypes:
+    - Ingress
+  ingress:
+    # Same-namespace only: any windyflo-ns pod may receive from any other windyflo-ns pod.
+    - from:
+        - podSelector: {}
+{{- end }}

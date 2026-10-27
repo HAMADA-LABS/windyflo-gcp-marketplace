@@ -1,0 +1,65 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "windyflo.configName" . }}
+  labels:
+    {{- include "windyflo.labels" . | nindent 4 }}
+data:
+  # --- Mode / queue ---
+  MODE: {{ .Values.config.MODE | quote }}
+  QUEUE_NAME: {{ .Values.config.QUEUE_NAME | quote }}
+  PORT: {{ .Values.config.PORT | quote }}
+  WORKER_PORT: {{ .Values.config.WORKER_PORT | quote }}
+  CORS_ORIGINS: {{ .Values.config.CORS_ORIGINS | quote }}
+
+  # --- Database (A3) ---
+  DATABASE_TYPE: "postgres"
+  DATABASE_HOST: {{ include "windyflo.pgHost" . | quote }}
+  DATABASE_PORT: "5432"
+  DATABASE_NAME: {{ .Values.data.postgres.database | quote }}
+  DATABASE_USER: {{ .Values.data.postgres.owner | quote }}
+  DATABASE_SSL: {{ .Values.config.DATABASE_SSL | quote }}
+  DATABASE_POOL_SIZE: {{ .Values.config.DATABASE_POOL_SIZE | quote }}
+  DATABASE_CONNECTION_TIMEOUT: {{ .Values.config.DATABASE_CONNECTION_TIMEOUT | quote }}
+  DATABASE_STATEMENT_TIMEOUT: {{ .Values.config.DATABASE_STATEMENT_TIMEOUT | quote }}
+  DATABASE_QUERY_TIMEOUT: {{ .Values.config.DATABASE_QUERY_TIMEOUT | quote }}
+
+  # --- Object storage (A3) ---
+  STORAGE_TYPE: {{ .Values.config.STORAGE_TYPE | quote }}
+  S3_STORAGE_BUCKET_NAME: {{ .Values.data.minio.bucket | quote }}
+  S3_STORAGE_REGION: {{ .Values.config.S3_STORAGE_REGION | quote }}
+  S3_ENDPOINT_URL: {{ include "windyflo.s3Endpoint" . | quote }}
+  S3_FORCE_PATH_STYLE: {{ .Values.config.S3_FORCE_PATH_STYLE | quote }}
+
+  # --- Redis (queue + events). Sentinel-aware client is an A4b code change; until then the
+  # bitnami `-redis` service routes 6379 to the current master. ---
+  REDIS_HOST: {{ include "windyflo.redisHost" . | quote }}
+  REDIS_PORT: "6379"
+  REDIS_TLS: {{ .Values.config.REDIS_TLS | quote }}
+
+  # --- Metrics (A14) ---
+  ENABLE_METRICS: {{ .Values.config.ENABLE_METRICS | quote }}
+  METRICS_PROVIDER: {{ .Values.config.METRICS_PROVIDER | quote }}
+  {{- range $k, $v := .Values.config.extra }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}
+
+  {{- /* Azure Marketplace (paid Kubernetes application offer): the AKS cluster extension overwrites
+         these Helm values at deploy time. Surfaced as env vars for packages/server/src/license/azure.ts,
+         which warns when they are missing — a sign the deployment is not being metered. Emitted only
+         when non-empty, so no other profile is affected. */}}
+  {{- with .Values.global.azure.marketplace }}
+  {{- if .planId }}
+  AZURE_MARKETPLACE_PLAN_ID: {{ .planId | quote }}
+  {{- end }}
+  {{- end }}
+  {{- with .Values.global.azure.extension }}
+  {{- if .resourceId }}
+  AZURE_MARKETPLACE_EXTENSION_RESOURCE_ID: {{ .resourceId | quote }}
+  {{- end }}
+  {{- end }}
+  {{- with .Values.global.azure.identity }}
+  {{- if .clientId }}
+  AZURE_MARKETPLACE_IDENTITY_CLIENT_ID: {{ .clientId | quote }}
+  {{- end }}
+  {{- end }}

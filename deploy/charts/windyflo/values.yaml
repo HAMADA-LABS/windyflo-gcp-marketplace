@@ -1,0 +1,636 @@
+# Default values for the WindyFlo umbrella chart.
+# Defaults target a sane PRODUCTION-HA posture. Override per environment with values-*.yaml:
+#   values-local.yaml  — single-node k3d, right-sized (1 PG instance, MinIO standalone)
+#   values-prod.yaml   — full HA (3 PG instances, 4-drive MinIO, Redis Sentinel)
+#   values-airgap.yaml — digest-pinned images from the internal mirror, internal CA, no internet
+
+# Empty on every profile except values-marketplace-azure.yaml. Azure's cpa packaging tool requires
+# every image ref resolvable via global.azure.images.<key> (registry/image/tag) — it rewrites these
+# at publish time to Microsoft's own ACR mirror. windyflo.image / windyflo.azureImage (_helpers.tpl)
+# check this map first and fall back to the normal image.repository/data.*.image values when empty,
+# so AWS/GCP/self-hosted profiles are unaffected.
+global:
+    azure:
+        images: {}
+
+# ----------------------------------------------------------------------------------------------
+# Image — ONE image for both main and worker (worker overrides command only). A5 collapses the
+# build to a single multi-arch image; reference by @sha256 digest in prod/air-gap (set image.digest).
+#
+# 🛑 ghcr.io/hamada-labs/windyflo:latest is a CONFIRMED BROKEN build (digest d083cb74..., verified
+# 2026-08-12 — see deploy/marketplace/images.txt) and no 3.0.x tag has EVER existed on GHCR ("manifest
+# unknown" for 3.0.13/3.0.14/3.0.15). The digest below used to be equally broken — it was never
+# actually pushed to ghcr.io/hamada-labs/windyflo at all ("manifest unknown"), just an aspirational
+# pin. Repointed 2026-08-12 at ghcr.io/hamada-labs/windyflo:modu.windyflo — a real image, built from
+# this same docker/Dockerfile, pushed for real, and verified end-to-end (booted, ran Postgres
+# migrations, served GET /api/v1/ping → 200). tag+digest both apply to this build until CI publishes
+# a real versioned release under its own tag — re-check deploy/marketplace/images.txt then.
+# ----------------------------------------------------------------------------------------------
+
+# Application version reported to users (app.kubernetes.io/version, NOTES.txt, GCP publishedVersion).
+# Empty means: derive it from image.tag when that looks like a SemVer version (arch suffixes such as
+# '-amd64' are stripped), else fall back to Chart.yaml's appVersion. Set this only when the reported
+# version must differ from the image tag. See the windyflo.appVersion helper.
+appVersionOverride: ''
+
+image:
+    repository: ghcr.io/hamada-labs/windyflo
+    tag: 'modu.windyflo'
+    full: '' # optional complete image reference; Marketplace substitutes this when republishing
+    # digest takes precedence over tag when set (e.g. sha256:abc...). REQUIRED for air-gap/prod.
+    # Multi-arch index digest (A5) — content-addressed, so identical on GHCR / Harbor / any mirror.
+    # Built linux/amd64 only for now (verified 2026-08-12); arm64 UNVERIFIED (see a5-plan §4).
+    digest: 'sha256:16e95b7148885357a03936f927d8981cb5b0303c47bc92e1b3462b73ce179947'
+    pullPolicy: IfNotPresent
+imagePullSecrets: []
+nameOverride: ''
+fullnameOverride: ''
+
+serviceAccount:
+    create: true
+    name: ''
+    annotations: {}
+
+# ----------------------------------------------------------------------------------------------
+# main (API/UI) — serves users
+# ----------------------------------------------------------------------------------------------
+main:
+    replicaCount: 2
+    port: 3000
+    # oclif entry directly (no pnpm/run-script-os in the prod image — A5)
+    command: ['node', '/app/bin/run', 'start']
+    resources:
+        requests: { cpu: 250m, memory: 512Mi }
+        # CPU limit set (2 cores) — Marketplace K8s-app certification requires BOTH cpu+memory
+        # limits on every workload. Generous headroom so HPA scales on load, not throttling.
+        limits: { cpu: '2', memory: 2Gi }
+    autoscaling:
+        enabled: true
+        minReplicas: 2
+        maxReplicas: 6
+        targetCPUUtilizationPercentage: 75
+    podDisruptionBudget:
+        enabled: true
+        # maxUnavailable (not minAvailable): with HPA scaling the replica count, a fixed
+        # minAvailable can block ALL voluntary evictions when current==min. maxUnavailable:1
+        # always permits one node drain at a time regardless of the live replica count.
+        maxUnavailable: 1
+    # Real-time SSE needs the same client pinned to one replica → ingress cookie affinity (see
+    # ingress.stickySession). y-websocket/Yjs collab is NOT served here (no shared Yjs state across
+    # replicas); WS-upgrade traffic is routed to the single-replica `collab` Deployment below.
+    livenessProbe:
+        httpGet: { path: /api/v1/ping, port: 3000 }
+        initialDelaySeconds: 40
+        periodSeconds: 10
+        failureThreshold: 6
+    readinessProbe:
+        httpGet: { path: /api/v1/ping, port: 3000 }
+        initialDelaySeconds: 20
+        periodSeconds: 10
+        failureThreshold: 6
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    # HA spread: keep replicas off the same node/zone so one node/zone loss can't take all of main.
+    # ScheduleAnyway (soft) → single-node clusters (local) still schedule; multi-node clusters spread.
+    # Disabled by setting topologySpreadConstraints: [] (values-local does this).
+    topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+              matchLabels:
+                  app.kubernetes.io/component: main
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+              matchLabels:
+                  app.kubernetes.io/component: main
+
+# ----------------------------------------------------------------------------------------------
+# collab (y-websocket / Yjs) — INTERIM single-replica pin (p1 §A6.7, §42).
+# Yjs doc state lives in a per-process Map (server index.ts ~L502-513); there is NO shared Yjs
+# backend or socket.io Redis adapter yet. With >1 replica, two clients editing the SAME doc can
+# land on different pods → split-brain. Sticky session only pins a *client*, not a *document*.
+# Interim fix: a dedicated replicas=1 Deployment serving ONLY the realtime upgrade paths; the
+# ingress routes WebSocket-upgrade traffic here while REST/UI stays on the HPA-scaled main.
+# This is a known SPOF, accepted for Phase 1 — the real fix (shared Yjs backend / y-redis) is the
+# named follow-on spike, NOT Phase 1.
+collab:
+    enabled: true
+    replicaCount: 1 # HARD pin — do not scale; Yjs state is not shared across pods.
+    # Ingress path the Yjs y-websocket client connects to (repoint the UI WebsocketProvider here so
+    # collab WS is cleanly path-split from /api REST — no Upgrade-header routing needed).
+    path: /collab
+    port: 3000
+    command: ['node', '/app/bin/run', 'start']
+    resources:
+        requests: { cpu: 250m, memory: 512Mi }
+        # CPU limit set (2 cores) for Marketplace certification (both limits required).
+        limits: { cpu: '2', memory: 2Gi }
+    podDisruptionBudget:
+        enabled: false # single replica: a PDB with minAvailable would block all voluntary evictions.
+    livenessProbe:
+        httpGet: { path: /api/v1/ping, port: 3000 }
+        initialDelaySeconds: 40
+        periodSeconds: 10
+        failureThreshold: 6
+    readinessProbe:
+        httpGet: { path: /api/v1/ping, port: 3000 }
+        initialDelaySeconds: 20
+        periodSeconds: 10
+        failureThreshold: 6
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+
+# ----------------------------------------------------------------------------------------------
+# worker — background BullMQ jobs (same image, different command + /healthz probe on 5566)
+# ----------------------------------------------------------------------------------------------
+worker:
+    replicaCount: 2
+    port: 5566
+    # Runs the baked healthcheck server in-process, then the worker via the oclif entry directly
+    # (no pnpm/run-script-os in the prod image — A5). healthcheck.js baked at /app/healthcheck.
+    command:
+        - /bin/sh
+        - -c
+        - node /app/healthcheck/healthcheck.js & node /app/bin/run worker
+    env:
+        NODE_OPTIONS: '--max-old-space-size=8192'
+    resources:
+        requests: { cpu: 250m, memory: 1Gi }
+        # CPU limit set (2 cores) for Marketplace certification (both limits required).
+        limits: { cpu: '2', memory: 4Gi }
+    autoscaling:
+        enabled: false
+        minReplicas: 2
+        maxReplicas: 8
+        targetCPUUtilizationPercentage: 75
+    podDisruptionBudget:
+        enabled: true
+        maxUnavailable: 1 # see main.podDisruptionBudget — drain-safe regardless of replica count
+    livenessProbe:
+        httpGet: { path: /healthz, port: 5566 }
+        initialDelaySeconds: 40
+        periodSeconds: 10
+        failureThreshold: 6
+    readinessProbe:
+        httpGet: { path: /healthz, port: 5566 }
+        initialDelaySeconds: 20
+        periodSeconds: 10
+        failureThreshold: 6
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    # HA spread (see main.topologySpreadConstraints). Soft so single-node still schedules.
+    topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+              matchLabels:
+                  app.kubernetes.io/component: worker
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+              matchLabels:
+                  app.kubernetes.io/component: worker
+
+# ----------------------------------------------------------------------------------------------
+# Service + Ingress
+# ----------------------------------------------------------------------------------------------
+service:
+    type: ClusterIP
+    port: 3000
+
+ingress:
+    enabled: true
+    className: nginx
+    host: windyflo.local
+    # Sticky session for SSE/realtime correctness with >1 main replica (ADR-A1b).
+    stickySession:
+        enabled: true
+        cookieName: windyflo_affinity
+        cookieExpires: '172800'
+    tls:
+        enabled: true
+        # cert-manager ClusterIssuer (internal CA for air-gap; letsencrypt for connected).
+        issuer: windyflo-internal-ca
+        secretName: windyflo-tls
+    annotations: {}
+
+# ----------------------------------------------------------------------------------------------
+# App configuration (A3 state externalization). Non-secret values → ConfigMap; secret values →
+# Secret (or ExternalSecret when externalSecrets.enabled). NEVER put secrets in config.* .
+# ----------------------------------------------------------------------------------------------
+config:
+    MODE: queue
+    QUEUE_NAME: windyflo
+    PORT: '3000'
+    WORKER_PORT: '5566'
+    CORS_ORIGINS: '*'
+    STORAGE_TYPE: s3
+    S3_FORCE_PATH_STYLE: 'true' # MANDATORY for MinIO
+    S3_STORAGE_REGION: us-east-1
+    # Bounded pool (A3). (mains + workers) x DATABASE_POOL_SIZE must stay under PG max_connections.
+    DATABASE_POOL_SIZE: '10'
+    DATABASE_CONNECTION_TIMEOUT: '10000'
+    DATABASE_STATEMENT_TIMEOUT: '60000'
+    DATABASE_QUERY_TIMEOUT: '60000'
+    DATABASE_SSL: 'false'
+    REDIS_TLS: 'false'
+    ENABLE_METRICS: 'true'
+    METRICS_PROVIDER: prometheus
+    # OpenTelemetry traces. To export spans set METRICS_PROVIDER: otel (the app's
+    # OpenTelemetry.ts supports OTLP http/grpc/proto) and put the in-cluster collector endpoint in
+    # config.extra.OTEL_EXPORTER_OTLP_ENDPOINT, e.g.:
+    #   http://otel-collector-opentelemetry-collector.monitoring.svc:4318
+    # Enable in an env by setting monitoring.traces=true (deploys Tempo + the collector).
+    # Extra non-secret env (Firebase project id, Stripe price ids, feature flags, etc.).
+    # To enable local stdio MCP servers, explicitly set CUSTOM_MCP_ALLOWED_COMMANDS here to
+    # comma-separated, operator-reviewed executable names/paths. CUSTOM_MCP_ALLOWED_ENV_VARS
+    # similarly allow-lists env var names; both default to deny-all. Never put env var values or
+    # secrets in this ConfigMap; use the Secret values above for credentials.
+    extra: {}
+
+# Secret app config. In real environments source these from ExternalSecrets (Vault) instead of
+# committing them. Empty string = chart will fail render with a helpful message for required keys.
+secrets:
+    # autoGenerate: when true, any REQUIRED secret you leave blank is generated as a strong random
+    # value at install and REUSED (via lookup) on every upgrade so it stays stable — critical for
+    # the master key, which encrypts all stored credentials. OFF by default (prod/local supply
+    # explicit values); the Azure Marketplace profile (values-marketplace.yaml) turns it ON so a
+    # buyer gets a self-contained deploy with no secrets to fill in and no Vault to run.
+    autoGenerate: false
+    # 🔴 ONE fixed key shared by every replica (A3). Queue mode REFUSES to boot without it.
+    WINDYFLO_SECRETKEY_OVERWRITE: ''
+    DATABASE_PASSWORD: ''
+    JWT_AUTH_TOKEN_SECRET: ''
+    JWT_REFRESH_TOKEN_SECRET: ''
+    EXPRESS_SESSION_SECRET: ''
+    TOKEN_HASH_SECRET: ''
+    # Storage credentials (least-privilege MinIO app user, NOT root)
+    S3_STORAGE_ACCESS_KEY_ID: ''
+    S3_STORAGE_SECRET_ACCESS_KEY: ''
+    # Free-form extra secret env
+    extra: {}
+
+externalSecrets:
+    # When true, templates/secret.yaml stops rendering the plaintext Secret and templates/
+    # externalsecret.yaml renders an ExternalSecret instead — ESO syncs the app Secret from the
+    # backend (Vault) via the ClusterSecretStore (cluster-config chart). Set dataFromKey OR
+    # remoteRefs (one is required, else the synced Secret is empty and pods can't boot).
+    enabled: false
+    secretStoreRef:
+        name: windyflo-vault
+        kind: ClusterSecretStore
+    refreshInterval: 1h
+    # Simple mode: pull EVERY key under one backend path into the app Secret (Vault KV: secret/<key>).
+    # e.g. windyflo -> expects WINDYFLO_SECRETKEY_OVERWRITE, DATABASE_PASSWORD, S3_* ... at that path.
+    dataFromKey: ''
+    # Explicit mode (additive): map each k8s secret key to a backend ref.
+    #   remoteRefs:
+    #     WINDYFLO_SECRETKEY_OVERWRITE: { key: windyflo, property: WINDYFLO_SECRETKEY_OVERWRITE }
+    #     DATABASE_PASSWORD:            { key: windyflo, property: DATABASE_PASSWORD }
+    remoteRefs: {}
+
+# ----------------------------------------------------------------------------------------------
+# Operator bundling (ADR-0005). Self-hosted path: all 4 default OFF — operators are installed
+# cluster-wide by helmfile, outside this chart, BEFORE it (unchanged). Azure Marketplace profile
+# (values-marketplace-azure.yaml) flips these ON so a buyer's fresh AKS cluster gets everything
+# from ONE `helm install`. Each key nests that operator's own chart values (parent key = the
+# dependency alias in Chart.yaml) — copied from deploy/operators/*/values.yaml.
+# ----------------------------------------------------------------------------------------------
+operators:
+    cnpg:
+        enabled: false
+    minioOperator:
+        enabled: false
+    certManager:
+        enabled: false
+    externalSecrets:
+        enabled: false
+
+# Three related bugs found + fixed 2026-08-24 on a real Azure Marketplace `helm install`, all
+# stemming from Chart.yaml aliasing subcharts with camelCase keys (cnpgOperator, certManager,
+# minioOperator — so THIS chart's own values blocks could target them by name) while the upstream
+# subcharts' own templates derive Kubernetes object/container names from `.Chart.Name`, which
+# resolves to the alias itself inside an aliased subchart's render context, with no lowercasing
+# applied anywhere:
+#
+#   1. cloudnative-pg's `.fullname` helper builds object names as
+#      `{{ .Release.Name }}-{{ .Chart.Name }}` — fixed with `nameOverride: cnpg-operator` below,
+#      which THAT helper respects as a fallback ahead of `.Chart.Name`.
+#   2. cert-manager AND minio-operator go further: cert-manager's 4 Deployments/Jobs and
+#      minio-operator's own operator-deployment.yaml hardcode container names as raw
+#      `{{ .Chart.Name }}[-<suffix>]`, bypassing any `.fullname`/`nameOverride` helper entirely —
+#      so nameOverride CANNOT fix either. The only real fix for both was renaming the Chart.yaml
+#      alias itself to an already-lowercase value (`cert-manager`, `minio-operator` — see
+#      Chart.yaml's comments), and each one's values block key renamed to match.
+#
+# All three produced invalid RFC 1123 names at different points ("windyflo-certManager-cainjector"
+# as an object name, "certManager-cainjector" as a container name after the first fix, then the
+# same container-name class of failure surfaced on minio-operator once cert-manager's was fixed
+# and rendering got further) — confirmed via THREE consecutive real `helm install`/`helm upgrade`
+# failures, not theoretical, and not something a single static read of these subcharts caught
+# reliably: the minio-operator container-name bug was missed on the first pass (only object names
+# were checked) and only surfaced by actually re-rendering after the cert-manager fix landed.
+cnpgOperator:
+    # MUST be exactly "cloudnative-pg" (round 4, found 2026-08-24) — NOT an arbitrary lowercase
+    # string. The operator binary itself (not a template) does self-discovery on startup via a
+    # HARDCODED label filter `app.kubernetes.io/name=cloudnative-pg` (see
+    # pkg/certs/operator_deployment.go in cloudnative-pg's own source) to find and take ownership
+    # of its own Deployment for PKI/webhook-cert setup. An earlier attempt set this to
+    # "cnpg-operator" (a reasonable-looking but wrong guess) — that value fixes the naming
+    # collision from round 1 but makes the operator's self-lookup fail with "no operator
+    # deployment found", crash-looping every replica. Confirmed via real pod logs, not
+    # documentation — this constraint isn't mentioned in cloudnative-pg's own chart README.
+    nameOverride: cloudnative-pg
+    crds: { create: true }
+    replicaCount: 2
+    podDisruptionBudget: { enabled: true, minAvailable: 1 }
+    resources:
+        requests: { cpu: 50m, memory: 100Mi }
+
+# Aliased to minio-operator (already lowercase) in Chart.yaml, not a camelCase alias — see that
+# file's comment; this subchart hardcodes its container name from .Chart.Name with no
+# nameOverride escape hatch, so the alias itself had to be renamed, found 2026-08-24.
+minio-operator:
+    operator:
+        replicaCount: 1
+        resources:
+            requests: { cpu: 50m, memory: 128Mi }
+
+cert-manager:
+    crds: { enabled: true, keep: true }
+    replicaCount: 2
+    resources:
+        requests: { cpu: 10m, memory: 64Mi }
+    podDisruptionBudget: { enabled: true, minAvailable: 1 }
+    webhook:
+        replicaCount: 2
+        podDisruptionBudget: { enabled: true, minAvailable: 1 }
+        resources:
+            requests: { cpu: 10m, memory: 32Mi }
+    cainjector:
+        replicaCount: 2
+        podDisruptionBudget: { enabled: true, minAvailable: 1 }
+        resources:
+            requests: { cpu: 10m, memory: 64Mi }
+
+# Aliased to external-secrets (already lowercase) in Chart.yaml, not a camelCase alias — see that
+# file's comment. Currently latent (operators.externalSecrets.enabled is false everywhere) but
+# fixed proactively rather than left as a landmine for whenever that operator is turned on.
+external-secrets:
+    installCRDs: true
+    replicaCount: 1
+    resources:
+        requests: { cpu: 10m, memory: 64Mi }
+    webhook:
+        resources:
+            requests: { cpu: 10m, memory: 32Mi }
+    certController:
+        resources:
+            requests: { cpu: 10m, memory: 32Mi }
+
+# In-chart Let's Encrypt ClusterIssuer (templates/clusterissuer.yaml), gated by
+# operators.certManager.enabled. Marketplace buyers don't get the sibling cluster-config chart
+# that normally creates this — this chart must own it when cert-manager is bundled.
+clusterIssuer:
+    enabled: false
+    issuerName: windyflo-letsencrypt
+    email: ''
+    server: https://acme-v02.api.letsencrypt.org/directory
+
+# ----------------------------------------------------------------------------------------------
+# Data layer (A4). Operators (CNPG, MinIO) are installed by helmfile; this chart renders their CRs.
+# Toggle each component off to use an external/managed endpoint instead (point config/secrets at it).
+# ----------------------------------------------------------------------------------------------
+data:
+    # plain=true (GCP Marketplace): Postgres and MinIO run as ordinary single-replica StatefulSets in
+    # the release namespace — no operator CRDs, no Helm hooks. Marketplace deployers allow neither
+    # (single-namespace rule; install hooks unsupported), so the CNPG/Tenant CRs cannot be used there.
+    plain: false
+    # ---- Postgres via CloudNativePG ----
+    postgres:
+        embedded: true
+        name: windyflo-pg
+        instances: 3 # 1 primary + 2 standbys (HA). Local override: 1.
+        imageName: ghcr.io/cloudnative-pg/postgresql:16.14-system-bookworm
+        storageSize: 20Gi
+        storageClass: ''
+        database: windyflo
+        owner: windyflo
+        # quorum synchronous replication → RPO 0 on single-node loss (ADR-A1a)
+        synchronous:
+            enabled: true
+            number: 1
+        # PgBouncer Pooler (transaction mode) for connection fan-out across replicas
+        pooler:
+            enabled: true
+            instances: 2
+            poolMode: transaction
+            # cpu+memory limits on the PgBouncer pods (Marketplace cert). Templated onto the CNPG
+            # Pooler's pgbouncer container; set {} to omit.
+            resources:
+                requests: { cpu: 50m, memory: 64Mi }
+                limits: { cpu: 500m, memory: 256Mi }
+        # Barman backups → in-cluster MinIO bucket (no cloud). PITR.
+        backup:
+            enabled: true
+            # Bucket the bootstrap Job creates and Barman writes to. MUST be the bucket component of
+            # destinationPath below (kept as an explicit field so the bootstrap Job can `mc mb` it —
+            # barman-cloud never auto-creates it).
+            bucket: windyflo-pg-backups
+            destinationPath: s3://windyflo-pg-backups/windyflo
+            # Used ONLY when MinIO is external (data.minio.embedded=false). When embedded, the endpoint
+            # is derived from windyflo.s3Endpoint so it tracks the release namespace (see cnpg-cluster.yaml).
+            endpointURL: http://windyflo-minio-hl.windyflo.svc:9000
+            retentionPolicy: 7d
+            # Automated base backup (A4/A16). CNPG ScheduledBackup CR — cron in the 6-field CNPG
+            # format (sec min hour dom mon dow). Default: daily 02:00. WAL is archived continuously
+            # regardless; this is the periodic base backup that bounds PITR replay time + RTO.
+            schedule:
+                enabled: true
+                cron: '0 0 2 * * *'
+        # cpu+memory limits (Marketplace cert requires limits on every workload — the data layer was
+        # previously requests-only). Generous ceiling; CNPG applies these to the Postgres pods.
+        resources:
+            requests: { cpu: 250m, memory: 512Mi }
+            limits: { cpu: '2', memory: 2Gi }
+
+    # ---- Redis HA (Sentinel) via bitnami subchart (NOT Cluster — BullMQ CROSSSLOT, ADR-A1b) ----
+    redis:
+        embedded: true
+        # plain mode only: full image ref for the in-chart Redis StatefulSet (schema.yaml substitutes it).
+        image: ''
+        # Passed through to the bitnami redis subchart below (see top-level `redis:` block).
+
+    # ---- MinIO via MinIO Operator (Tenant CR) ----
+    minio:
+        embedded: true
+        name: windyflo-minio
+        # Pinned MinIO server image (NOT :latest) — reproducible builds + air-gap mirrorable.
+        image: quay.io/minio/minio:RELEASE.2025-07-23T15-57-54Z
+        mode: distributed # distributed (HA, EC) | standalone (edge/local, non-HA)
+        servers: 4
+        volumesPerServer: 1
+        storageSize: 20Gi
+        storageClass: ''
+        bucket: windyflo
+        # cpu+memory limits on the MinIO server pods (Marketplace cert). Set {} to omit.
+        resources:
+            requests: { cpu: 250m, memory: 512Mi }
+            limits: { cpu: '2', memory: 2Gi }
+        # bucket auto-created by the bootstrap Job (least-privilege app user, versioning on)
+        bootstrap:
+            enabled: true
+            versioning: true
+            logsExpiryDays: 30
+            # Pinned mc client image (NOT :latest) — reproducible + air-gap mirrorable.
+            image: quay.io/minio/mc:RELEASE.2025-07-23T23-35-36Z
+            # cpu+memory limits on the one-shot bootstrap Job pod (Marketplace cert; small — it only runs mc).
+            resources:
+                requests: { cpu: 50m, memory: 64Mi }
+                limits: { cpu: 250m, memory: 128Mi }
+
+# Bitnami Redis subchart values (only used when data.redis.embedded=true)
+# NOTE: Bitnami relocated free images to docker.io/bitnamilegacy (Aug 2025); the old
+# docker.io/bitnami/* paths now 401/404 → ImagePullBackOff. Repoint every sub-image to the
+# legacy archive and allow the non-default registry (chart guards against it otherwise).
+redis:
+    global:
+        security:
+            allowInsecureImages: true
+    architecture: replication
+    sentinel:
+        enabled: true
+        image:
+            repository: bitnamilegacy/redis-sentinel
+            tag: 8.2.1-debian-12-r0
+        resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 250m, memory: 128Mi }
+    image:
+        repository: bitnamilegacy/redis
+        tag: 8.2.1-debian-12-r0
+    metrics:
+        image:
+            repository: bitnamilegacy/redis-exporter
+            tag: 1.67.0-debian-12-r0
+    kubectl:
+        image:
+            repository: bitnamilegacy/kubectl
+            tag: 1.32.0-debian-12-r0
+    volumePermissions:
+        image:
+            repository: bitnamilegacy/os-shell
+            tag: 12-debian-12-r34
+    sysctl:
+        image:
+            repository: bitnamilegacy/os-shell
+            tag: 12-debian-12-r34
+    auth:
+        enabled: true
+        existingSecret: windyflo-redis-auth
+        existingSecretPasswordKey: redis-password
+    # HA: soft node anti-affinity so master + replicas spread across nodes (one node loss ≠ all Redis).
+    # Soft so a single-node local cluster still schedules. values-local can leave this; 1 replica there.
+    # cpu+memory limits on every Redis container (Marketplace cert requires limits on all workloads).
+    master:
+        persistence: { enabled: true, size: 8Gi }
+        podAntiAffinityPreset: soft
+        resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+    replica:
+        replicaCount: 2
+        persistence: { enabled: true, size: 8Gi }
+        podAntiAffinityPreset: soft
+        resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+
+# ----------------------------------------------------------------------------------------------
+# Metrics scraping (A14) — ServiceMonitor for the main service (requires Prometheus Operator CRDs)
+# ----------------------------------------------------------------------------------------------
+metrics:
+    serviceMonitor:
+        enabled: true
+        interval: 30s
+        path: /api/v1/metrics
+
+# ----------------------------------------------------------------------------------------------
+# Security hardening (A15). The app image runs as ROOT because puppeteer/Chromium needs it (PDF /
+# screenshot rendering) — so app pods target PSS **baseline**, NOT restricted: we drop every Linux
+# capability, block privilege escalation, and pin seccomp=RuntimeDefault, but cannot set
+# runAsNonRoot/readOnlyRootFilesystem without reworking the Chromium sandbox (named follow-on).
+# The data layer (Postgres/MinIO/Redis, managed by their operators) DOES run restricted.
+# Namespace PSS enforcement is applied by helmfile (pod-security.kubernetes.io labels on the ns).
+# ----------------------------------------------------------------------------------------------
+podSecurityContext:
+    # No runAsNonRoot here — Chromium needs root. seccomp at pod scope covers all containers.
+    seccompProfile:
+        type: RuntimeDefault
+securityContext:
+    # PSS baseline-clean: surrender capabilities + block escalation even while running as root.
+    allowPrivilegeEscalation: false
+    capabilities:
+        drop: ['ALL']
+    # readOnlyRootFilesystem stays OFF — Chromium writes to /tmp, /home, and the app's working dir.
+    readOnlyRootFilesystem: false
+
+# NetworkPolicy (A15) — default-deny ingress in the windyflo namespace, then explicit allows:
+# ingress-nginx → main/collab/worker, intra-namespace app↔data-layer, and DNS egress. Off by
+# default so local/dev bring-up isn't gated on CNI policy support (k3d's flannel enforces it, but
+# managed clusters vary); flip on per-env (values-prod/airgap set it true).
+networkPolicy:
+    enabled: false
+    # Namespace label selector for the ingress controller's namespace (allows inbound web traffic).
+    ingressControllerNamespace: ingress-nginx
+    # Allow Prometheus (monitoring ns) to scrape /metrics on main + the worker /healthz.
+    monitoringNamespace: monitoring
+
+# GCP Marketplace (GKE Kubernetes-app offer) — off by default. Only turns on templates/application.yaml
+# (the Application CR the Marketplace UI reads). See values-marketplace-gcp.yaml + docs/gcp-marketplace-listing.md.
+gcpMarketplace:
+    enabled: false
+
+    # ---- ubbagent: GCP Marketplace usage-reporting sidecar (PAID GCP listing only) ----
+    # GCP meters buyer-deployed Kubernetes apps by having the deployment report usage to Google
+    # Service Control; Google's usage-based billing agent does that reporting. OFF by default —
+    # values-marketplace-gcp-paid.yaml is the only profile that enables it. Note this reports usage
+    # so the seller gets paid; GCP exposes no entitlement check, so it cannot block unpaid use.
+    ubbagent:
+        enabled: false
+        image: ''
+        # Marketplace provisions this Secret in the target namespace before the app deploys; its name
+        # is supplied through the deployer's REPORTING_SECRET-annotated schema.yaml parameter.
+        reportingSecretName: ''
+        # Metric name + service name are minted by the Marketplace team when the pricing model is
+        # submitted (service format: my-application.mp-my-company.appspot.com).
+        serviceName: ''
+        metricName: ''
+        resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { cpu: 100m, memory: 128Mi }
+
+    # publishedVersion MUST be strict SemVer *including the patch* ("3.0.13", never "3.0") and MUST be
+    # byte-identical to x-google-marketplace.publishedVersion in deploy/marketplace/gcp/schema.yaml.
+    # The deployer runs validate_app_resource.py on every install and hard-fails with
+    #   Application resource's spec.descriptor.version "X" does not match schema.yaml's publishedVersion "Y"
+    # if they differ. Empty => falls back to .Chart.AppVersion.
+    publishedVersion: ''
+
+    # partnerId/productId come from the Producer Portal listing and are emitted into the REQUIRED
+    # marketplace.cloud.google.com/deploy-info annotation. The deployer hard-fails
+    # ('Application resource is missing "marketplace.cloud.google.com/deploy-info" annotation', and
+    # separately if the JSON lacks partner_id / product_id) — so these must be set before packaging.
+    # Left blank here on purpose: the chart `fail`s loudly at render time rather than shipping a
+    # deployer that dies inside the buyer's cluster.
+    partnerId: ''
+    productId: ''
+    partnerName: Hamada Labs

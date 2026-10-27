@@ -1,0 +1,27 @@
+WindyFlo {{ include "windyflo.appVersion" . }} deployed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Components:
+  main:    {{ .Values.main.replicaCount }} replica(s){{ if .Values.main.autoscaling.enabled }} (HPA {{ .Values.main.autoscaling.minReplicas }}-{{ .Values.main.autoscaling.maxReplicas }}){{ end }}
+  worker:  {{ .Values.worker.replicaCount }} replica(s)
+  postgres (CNPG):  {{ if .Values.data.postgres.embedded }}{{ .Values.data.postgres.instances }} instance(s){{ else }}external{{ end }}
+  redis:            {{ if .Values.data.redis.embedded }}embedded{{ if .Values.redis.sentinel.enabled }} (sentinel){{ end }}{{ else }}external{{ end }}
+  minio:            {{ if .Values.data.minio.embedded }}{{ .Values.data.minio.mode }}{{ else }}external{{ end }}
+
+Reach the app:
+{{- if .Values.ingress.enabled }}
+  https://{{ .Values.ingress.host }}/   (add to /etc/hosts → ingress LB IP)
+  Health:  https://{{ .Values.ingress.host }}/api/v1/ping
+{{- else }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "windyflo.fullname" . }}-main {{ .Values.service.port }}:{{ .Values.service.port }}
+{{- end }}
+
+Check rollout:
+  kubectl -n {{ .Release.Namespace }} get pods,svc,cluster.postgresql.cnpg.io,tenant.minio.min.io
+
+{{- /* Only warn when the key is genuinely absent. With secrets.autoGenerate (every marketplace
+       profile) templates/secret.yaml generates and persists it, so warning here was false and
+       alarming on a healthy install — flagged during the 2026-08-17 EKS validation. */ -}}
+{{- if and (not .Values.secrets.WINDYFLO_SECRETKEY_OVERWRITE) (not .Values.secrets.autoGenerate) }}
+
+⚠️  WINDYFLO_SECRETKEY_OVERWRITE is unset — queue mode will refuse to boot. Set a fixed key.
+{{- end }}

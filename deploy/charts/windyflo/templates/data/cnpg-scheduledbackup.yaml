@@ -1,0 +1,24 @@
+{{- if and .Values.data.postgres.embedded (not .Values.data.plain) .Values.data.postgres.backup.enabled .Values.data.postgres.backup.schedule.enabled }}
+{{- /* CNPG ScheduledBackup (A4/A16) — periodic base backup to the same Barman object store the
+       Cluster.spec.backup points at (in-cluster MinIO). WAL archiving is continuous; this base
+       backup bounds how much WAL PITR must replay (→ bounds restore RTO) and lets the retention
+       policy prune. Cron is CNPG's 6-field format: "sec min hour dom mon dow".
+       helm.sh/hook (see cnpg-cluster.yaml for the full rationale): same CRD-not-yet-registered
+       issue on the bundled-operator profiles, plus this CR references the Cluster by name — weight
+       20 orders it strictly after the Cluster's own hook (weight 10). */ -}}
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: {{ .Values.data.postgres.name }}-scheduled
+  labels:
+    {{- include "windyflo.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "20"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  schedule: {{ .Values.data.postgres.backup.schedule.cron | quote }}
+  backupOwnerReference: self
+  cluster:
+    name: {{ .Values.data.postgres.name }}
+{{- end }}

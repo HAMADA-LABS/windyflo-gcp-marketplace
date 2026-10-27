@@ -1,0 +1,3 @@
+# Build artifacts staged by build-deployer.sh — do not commit
+chart/
+schema.yaml

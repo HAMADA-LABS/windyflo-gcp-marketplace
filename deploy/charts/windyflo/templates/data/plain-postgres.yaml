@@ -1,0 +1,116 @@
+{{- if and .Values.data.plain .Values.data.postgres.embedded }}
+{{- /* Plain single-replica Postgres for marketplace deployers that cannot use operator CRDs or Helm
+       hooks (see data.plain in values.yaml). Uses the patched official postgres:16-alpine image
+       (deploy/marketplace/gcp/images/postgres) whose entrypoint initialises the cluster on first start.
+       Service name <name>-rw keeps windyflo.pgHost working unchanged (pooler must be disabled). */ -}}
+{{- $pg := .Values.data.postgres }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $pg.name }}-auth
+  labels:
+    {{- include "windyflo.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  POSTGRES_PASSWORD: {{ include "windyflo.dbPassword" . | quote }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $pg.name }}-rw
+  labels:
+    {{- include "windyflo.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/name: {{ $pg.name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $pg.name }}
+  labels:
+    {{- include "windyflo.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  # Delete the PVCs with the StatefulSet: Marketplace uninstall must leave nothing behind
+  # ("Some resources were not deleted"), and PVCs are not covered by the Application's ownership.
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Delete
+    whenScaled: Retain
+  serviceName: {{ $pg.name }}-rw
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $pg.name }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ $pg.name }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: postgres
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70
+        runAsGroup: 70
+        fsGroup: 70
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: {{ include "windyflo.azureImage" (dict "root" . "key" "postgres" "fallback" $pg.imageName) | quote }}
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            - name: POSTGRES_USER
+              value: {{ $pg.owner | quote }}
+            - name: POSTGRES_DB
+              value: {{ $pg.database | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $pg.name }}-auth
+                  key: POSTGRES_PASSWORD
+          # Official-image entrypoint: initialises PGDATA + owner role + database on first start.
+          args: ["postgres", "-c", "max_connections=200", "-c", "statement_timeout=60000"]
+          ports:
+            - name: postgres
+              containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-h", "127.0.0.1", "-p", "5432"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-h", "127.0.0.1", "-p", "5432"]
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            {{- toYaml $pg.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with $pg.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $pg.storageSize }}
+{{- end }}

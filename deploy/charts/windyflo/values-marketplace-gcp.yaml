@@ -1,0 +1,107 @@
+# GCP Marketplace profile — a SELF-CONTAINED, turnkey deploy for a buyer who clicks "Deploy" on
+# the Google Cloud Marketplace GKE listing page. Differs from values-gcp.yaml (which assumes YOUR
+# ops team + helmfile + Vault):
+#   • images point at Artifact Registry (the publisher's registry) — required, no ghcr.io/quay.io/docker.io
+#   • secrets AUTO-GENERATE — no Vault, nothing for the buyer to fill in beyond the deployer form
+#   • ExternalSecrets OFF — the in-chart Secret is used instead
+#   • gcpMarketplace.enabled: true — renders the Application CR the Marketplace UI reads
+#
+# Before packaging:
+#   1. run deploy/marketplace/gcp/mirror-images-to-gar.sh to populate Artifact Registry
+#   2. replace EVERY us-docker.pkg.dev/windyflo-public/windyflo-marketplace below with your repo path (e.g. us-docker.pkg.dev/my-project/windyflo-public)
+#   3. tag every mirrored image with BOTH the release-track tag and the exact version (GCP requirement)
+#   4. stamp the com.googleapis.cloudmarketplace.product.service.name annotation on every image
+#      manifest (see mirror script — this is GCP's Jan-2025 requirement, no Azure/ACR equivalent)
+
+# ---- primary app image: from the publisher's Artifact Registry (no ghcr.io) ----
+# Marketplace release image built from the patched 3.1.4 source and pinned after GCP annotation.
+image:
+    repository: us-docker.pkg.dev/windyflo-public/windyflo-marketplace/windyflo/windyflo
+    tag: '3.1.4'
+    digest: 'sha256:c840b7f86c1244c51a797ce005094a24dcf07e6aa7783ec3f29459b6dc6c30d1'
+    full: 'us-docker.pkg.dev/windyflo-public/windyflo-marketplace/windyflo/windyflo@sha256:c840b7f86c1244c51a797ce005094a24dcf07e6aa7783ec3f29459b6dc6c30d1'
+    pullPolicy: IfNotPresent
+
+gcpMarketplace:
+    enabled: true
+    # REPLACE_ME placeholders keep this profile renderable (so the 11-profile regression stays green)
+    # while making it impossible to ship them by accident: build-deployer.sh refuses to package a
+    # deployer whose values still contain REPLACE_ME. Both come from the Producer Portal listing and
+    # are emitted into the required marketplace.cloud.google.com/deploy-info annotation.
+    partnerId: windyflo-public
+    productId: windyflo.endpoints.windyflo-public.cloud.goog
+    # Set by build-deployer.sh from $VERSION; must equal schema.yaml's publishedVersion exactly.
+    publishedVersion: ''
+
+# ---- secrets: self-contained, zero buyer input ----
+secrets:
+    autoGenerate: true # generate + persist strong random secrets at install (see templates/secret.yaml)
+
+externalSecrets:
+    enabled: false # no Vault dependency on the marketplace path
+
+# ---- data layer: GAR images + HA sizing ----
+# NOTE: the instances/storageSize/replicaCount/autoscaling values below intentionally MIRROR
+# values-gcp.yaml. Kept as a separate, self-contained file (not layered via -f) so the GCP deployer
+# image's single HELM_VALUES (see deployer/Dockerfile) stays self-contained — see docs/gcp-marketplace-listing.md.
+# If you change HA/sizing defaults here, update values-gcp.yaml too (and vice versa) or the
+# marketplace and direct-deploy paths will silently drift.
+data:
+    # Plain StatefulSets, no operator CRDs / Helm hooks: the Marketplace deployer is single-namespace
+    # and rejects install hooks, and a stock GKE cluster has no CNPG / MinIO operator. See values.yaml.
+    # Image refs below are placeholders for schema.yaml, which swaps in Google's per-deployment copies
+    # (tag = publishedVersion). Built from deploy/marketplace/gcp/images/*.
+    plain: true
+    postgres:
+        imageName: us-docker.pkg.dev/windyflo-public/windyflo-marketplace/windyflo/postgresql:3.1.3
+        instances: 1
+        storageSize: 50Gi
+        storageClass: premium-rwo # GCP PD-SSD CSI
+        synchronous: { enabled: false }
+        pooler: { enabled: false }
+        backup: { enabled: false }
+    minio:
+        image: us-docker.pkg.dev/windyflo-public/windyflo-marketplace/windyflo/minio:3.1.3
+        mode: standalone
+        servers: 1
+        volumesPerServer: 1
+        storageSize: 100Gi
+        storageClass: premium-rwo
+    redis:
+        embedded: true
+        subchart: false # Bitnami subchart off; plain-redis.yaml runs the patched official image
+        image: us-docker.pkg.dev/windyflo-public/windyflo-marketplace/windyflo/redis:3.1.3
+
+# ---- Kyverno cosign verifyImages glob must match the GAR image, not ghcr ----
+verifyImages:
+    imageGlobs: 'us-docker.pkg.dev/windyflo-public/windyflo-marketplace/windyflo/windyflo*'
+
+# ---- app sizing (buyer can scale via the deployer schema.yaml form) ----
+main:
+    replicaCount: 2
+    autoscaling: { enabled: true, minReplicas: 2, maxReplicas: 8 }
+    podDisruptionBudget: { enabled: true, minAvailable: 1 }
+worker:
+    replicaCount: 2
+    autoscaling: { enabled: true, minReplicas: 2, maxReplicas: 8 }
+    podDisruptionBudget: { enabled: true, minAvailable: 1 }
+
+# No cert-manager on a stock GKE cluster (cluster-scoped CRDs cannot ship inside the single-namespace
+# deployer), so no ClusterIssuer and no cert-manager annotation. Buyers who run cert-manager can set
+# ingress.tls.enabled=true + ingress.tls.issuer after install, or terminate TLS at their load balancer.
+clusterIssuer:
+    enabled: false
+
+ingress:
+    host: windyflo.example.com # OVERRIDDEN by the buyer via the deployer schema.yaml
+    tls:
+        enabled: false
+
+metrics:
+    # OFF by default: ServiceMonitor is a CRD from the Prometheus Operator, which is not a
+    # disclosed buyer prerequisite. Buyers who already run kube-prometheus-stack can flip this
+    # to true in their own values.yaml.
+    serviceMonitor: { enabled: false }
+
+networkPolicy:
+    enabled: true

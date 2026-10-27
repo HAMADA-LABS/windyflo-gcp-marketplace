@@ -1,0 +1,17 @@
+{{- if .Values.metrics.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "windyflo.fullname" . }}-main
+  labels:
+    {{- include "windyflo.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "windyflo.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: main
+  endpoints:
+    - port: http
+      path: {{ .Values.metrics.serviceMonitor.path }}
+      interval: {{ .Values.metrics.serviceMonitor.interval }}
+{{- end }}

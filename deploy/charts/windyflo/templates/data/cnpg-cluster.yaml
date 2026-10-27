@@ -1,0 +1,107 @@
+{{- if and .Values.data.postgres.embedded (not .Values.data.plain) }}
+{{- /* Owner role password — CNPG reads username/password from this Secret. Applied as an ordinary
+       release resource (not a hook): it carries no CRD dependency, and the Cluster CR below (which
+       does) reads it by name, so it must exist before the hook phase runs. */}}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Values.data.postgres.name }}-owner-auth
+  labels:
+    {{- include "windyflo.labels" . | nindent 4 }}
+type: kubernetes.io/basic-auth
+stringData:
+  username: {{ .Values.data.postgres.owner | quote }}
+  # Single-sourced with the app Secret's DATABASE_PASSWORD via windyflo.dbPassword — MUST match or
+  # the app can't authenticate to Postgres. Never read the raw .Values.secrets.DATABASE_PASSWORD here
+  # (it is empty on the autoGenerate/marketplace + ESO paths → auth failure).
+  password: {{ include "windyflo.dbPassword" . | quote }}
+---
+{{/* CloudNativePG Cluster CR (ADR-A1a). helm.sh/hook (ADR-0005 marketplace-bundling follow-up,
+       2026-08-24): on the bundled-operator profiles, the CNPG operator installs IN THE SAME
+       `helm install` as this CR (Chart.yaml subchart dependency, not a helmfile pre-step), and its
+       CRDs ship as plain templates (not Helm's special crds/ folder) — so without deferral, Helm's
+       single-pass manifest apply can hit "no matches for kind Cluster in version postgresql.cnpg.io/v1"
+       before the operator's CRD is even registered. post-install/post-upgrade + a hook-weight after
+       the operator's own resources defers this until the operator Deployment exists.
+       KNOWN LIMITATION: a hook-weight only orders resource application, it does NOT wait for the
+       operator's admission webhook to actually be serving — CNPG's webhook can still 404 for a few
+       seconds after its pod is merely Scheduled. If `helm install` reports this hook failed, retry
+       `helm upgrade` with the same values once the CNPG operator pod is Running; this is a real,
+       accepted race, not a flake to silence. ALSO NOTE: hooks run strictly after `--wait`'s own
+       readiness check passes, so `helm install --wait` now reports success BEFORE this Cluster (and
+       the Postgres pods it creates) exists — verify Postgres came up with a separate
+       `kubectl get pods -w`, don't trust --wait alone for this profile (see
+       docs/azure-marketplace-listing.md §5). */}}
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: {{ .Values.data.postgres.name }}
+  labels:
+    {{- include "windyflo.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "10"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  instances: {{ .Values.data.postgres.instances }}
+  imageName: {{ include "windyflo.azureImage" (dict "root" . "key" "postgres" "fallback" .Values.data.postgres.imageName) }}
+  primaryUpdateStrategy: unsupervised
+
+  {{- if gt (int .Values.data.postgres.instances) 1 }}
+  # HA: keep PG instances off the same node/zone so a node/zone loss can't take the whole cluster.
+  # preferred (soft) so a smaller cluster still schedules; flip to required on a true multi-AZ fleet.
+  affinity:
+    enablePodAntiAffinity: true
+    topologyKey: kubernetes.io/hostname
+    podAntiAffinityType: preferred
+  {{- end }}
+
+  bootstrap:
+    initdb:
+      database: {{ .Values.data.postgres.database }}
+      owner: {{ .Values.data.postgres.owner }}
+      secret:
+        name: {{ .Values.data.postgres.name }}-owner-auth
+
+  {{- if and .Values.data.postgres.synchronous.enabled (gt (int .Values.data.postgres.instances) 1) }}
+  postgresql:
+    # quorum synchronous replication → RPO 0 on single-node loss
+    synchronous:
+      method: any
+      number: {{ .Values.data.postgres.synchronous.number }}
+    parameters:
+      statement_timeout: "60000"
+  {{- end }}
+
+  storage:
+    size: {{ .Values.data.postgres.storageSize }}
+    {{- with .Values.data.postgres.storageClass }}
+    storageClass: {{ . }}
+    {{- end }}
+
+  resources:
+    {{- toYaml .Values.data.postgres.resources | nindent 4 }}
+
+  {{- if .Values.data.postgres.backup.enabled }}
+  backup:
+    barmanObjectStore:
+      destinationPath: {{ .Values.data.postgres.backup.destinationPath }}
+      # When MinIO is embedded, derive the endpoint from the same helper the app uses so it tracks
+      # .Release.Namespace (the static value hardcoded the `windyflo` ns → wrong DNS in any other ns).
+      {{- if .Values.data.minio.embedded }}
+      endpointURL: {{ include "windyflo.s3Endpoint" . | quote }}
+      {{- else }}
+      endpointURL: {{ .Values.data.postgres.backup.endpointURL | quote }}
+      {{- end }}
+      s3Credentials:
+        accessKeyId:
+          name: {{ include "windyflo.secretName" . }}
+          key: S3_STORAGE_ACCESS_KEY_ID
+        secretAccessKey:
+          name: {{ include "windyflo.secretName" . }}
+          key: S3_STORAGE_SECRET_ACCESS_KEY
+      wal:
+        compression: gzip
+    retentionPolicy: {{ .Values.data.postgres.backup.retentionPolicy | quote }}
+  {{- end }}
+{{- end }}

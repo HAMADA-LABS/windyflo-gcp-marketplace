@@ -1,0 +1,119 @@
+{{- if and .Values.data.minio.embedded .Values.data.minio.bootstrap.enabled (not .Values.data.plain) }}
+{{- /* MinIO bucket bootstrap (ADR-A1c). Idempotent: creates the bucket, enables versioning, blocks
+       public access, and provisions a LEAST-PRIVILEGE app user (NOT root) bound to that bucket.
+       Closes the "app never creates the bucket" gap.
+
+       NOT a Helm hook, deliberately. It used to carry:
+         "helm.sh/hook": post-install,post-upgrade
+       which DEADLOCKS under `helm install --wait` — the flag AWS Marketplace's generated launch
+       command uses. Helm blocks on workload readiness before running post-install hooks, but the app
+       pods cannot become Ready until this Job has created the bucket and the app's MinIO user. The
+       app then loops on NoSuchBucket / InvalidAccessKeyId forever and the install times out.
+       Reproduced on a real EKS cluster 2026-08-17.
+
+       As an ordinary release resource the Job is applied alongside the Deployments and runs
+       immediately. The app may crash-loop for a few seconds until the bucket and user exist, then
+       recovers on its own — brief, self-healing, and it works under --wait.
+
+       A ttlSecondsAfterFinished replaces the old hook-delete-policy so completed Jobs are still
+       reaped. The name is release-scoped and the Job is immutable once created, so `helm upgrade`
+       needs it to be replaceable: see the annotation below. */ -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "windyflo.fullname" . }}-minio-bootstrap-{{ .Release.Revision }}
+  labels:
+    {{- include "windyflo.labels" . | nindent 4 }}
+  annotations:
+    # A Job's spec.template is immutable, so reusing one name across upgrades fails with
+    # "field is immutable". The revision suffix gives each upgrade its own Job; ttl reaps the old.
+    "helm.sh/resource-policy": keep
+spec:
+  # Reap finished Jobs (24h) — previously handled by hook-delete-policy.
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 10
+  template:
+    metadata:
+      labels:
+        {{- include "windyflo.selectorLabels" . | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      # PSS baseline + Kyverno require-drop-capabilities safe: seccomp at pod scope covers the container.
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mc
+          # Image ref lives ONLY in values (no hardcoded external-registry fallback — AWS flags
+          # INVALID_IMAGE_REFERENCE; a blank value must fail loudly, not silently pull from elsewhere).
+          image: {{ include "windyflo.azureImage" (dict "root" . "key" "minioMc" "fallback" .Values.data.minio.bootstrap.image) | quote }}
+          # drop-ALL + no-privilege-escalation so this hook still admits when the namespace PSS/Kyverno
+          # policy is flipped from Audit to Enforce (no runAsNonRoot: mc writes its config under $HOME).
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.data.minio.bootstrap.resources | nindent 12 }}
+          volumeMounts:
+            - name: mc-home
+              mountPath: /tmp/mc-home
+          env:
+            {{- $minioCreds := include "windyflo.minioRootCreds" . | splitList "|" }}
+            # drop:ALL removes CAP_DAC_OVERRIDE, so even UID 0 can't write to /root on images that
+            # ship it read-only (e.g. bitnamilegacy/minio-mc). Point HOME at a writable emptyDir
+            # instead of re-adding the capability.
+            - name: HOME
+              value: /tmp/mc-home
+            - name: ENDPOINT
+              value: {{ include "windyflo.s3Endpoint" . | quote }}
+            - name: ROOT_USER
+              value: {{ first $minioCreds | quote }}
+            - name: ROOT_PASSWORD
+              value: {{ last $minioCreds | quote }}
+            - name: BUCKET
+              value: {{ .Values.data.minio.bucket | quote }}
+            {{- if .Values.data.postgres.backup.enabled }}
+            - name: BACKUP_BUCKET
+              value: {{ .Values.data.postgres.backup.bucket | quote }}
+            {{- end }}
+            - name: APP_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "windyflo.secretName" . }}
+                  key: S3_STORAGE_ACCESS_KEY_ID
+            - name: APP_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "windyflo.secretName" . }}
+                  key: S3_STORAGE_SECRET_ACCESS_KEY
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              echo "Waiting for MinIO at $ENDPOINT ..."
+              until mc alias set t "$ENDPOINT" "$ROOT_USER" "$ROOT_PASSWORD" 2>/dev/null; do sleep 3; done
+              mc mb --ignore-existing t/"$BUCKET"
+              {{- if .Values.data.postgres.backup.enabled }}
+              # CNPG Barman writes WAL + base backups here (data.postgres.backup.destinationPath).
+              # barman-cloud does NOT auto-create the bucket → without this, every backup fails NoSuchBucket.
+              mc mb --ignore-existing t/"$BACKUP_BUCKET"
+              mc version enable t/"$BACKUP_BUCKET"
+              mc anonymous set none t/"$BACKUP_BUCKET"
+              {{- end }}
+              {{- if .Values.data.minio.bootstrap.versioning }}
+              mc version enable t/"$BUCKET"
+              {{- end }}
+              mc anonymous set none t/"$BUCKET"
+              {{- if .Values.data.minio.bootstrap.logsExpiryDays }}
+              mc ilm rule add --expire-days {{ .Values.data.minio.bootstrap.logsExpiryDays }} --prefix logs/ t/"$BUCKET" || true
+              {{- end }}
+              # least-privilege app user (idempotent)
+              mc admin user add t "$APP_KEY" "$APP_SECRET" || true
+              mc admin policy attach t readwrite --user "$APP_KEY" || true
+              echo "MinIO bootstrap complete for bucket $BUCKET"
+      volumes:
+        - name: mc-home
+          emptyDir: {}
+{{- end }}

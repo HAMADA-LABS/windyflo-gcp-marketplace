@@ -1,0 +1,71 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "windyflo.fullname" . }}
+  labels:
+    {{- include "windyflo.labels" . | nindent 4 }}
+  annotations:
+    {{- if .Values.ingress.stickySession.enabled }}
+    # SSE / y-websocket correctness with >1 main replica (ADR-A1b): pin a client to one replica.
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+    nginx.ingress.kubernetes.io/affinity-mode: "persistent"
+    nginx.ingress.kubernetes.io/session-cookie-name: {{ .Values.ingress.stickySession.cookieName | quote }}
+    nginx.ingress.kubernetes.io/session-cookie-expires: {{ .Values.ingress.stickySession.cookieExpires | quote }}
+    nginx.ingress.kubernetes.io/session-cookie-max-age: {{ .Values.ingress.stickySession.cookieExpires | quote }}
+    # SSE needs buffering off + long read timeout so token streams aren't cut.
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    {{- end }}
+    {{- if and .Values.collab.enabled (not .Values.ingress.stickySession.enabled) }}
+    # Long read-timeout for the Yjs/socket.io WS upgrade (the stickySession block already sets this
+    # when enabled). Collab paths get their own backend rule below → the single-replica collab
+    # Service, so no Upgrade-header gymnastics are needed.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    {{- end }}
+    {{- if .Values.ingress.tls.enabled }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuer | quote }}
+    {{- end }}
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host | quote }}
+      secretName: {{ .Values.ingress.tls.secretName }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          {{- if .Values.collab.enabled }}
+          # Realtime collab → single-replica collab Service (must precede the `/` catch-all; nginx
+          # picks the longest matching prefix, so these win for their paths). socket.io presence
+          # and the Yjs y-websocket upgrade (client repointed to {{ .Values.collab.path }}) both
+          # converge on one pod → no split Yjs Map across replicas.
+          - path: /socket.io
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "windyflo.fullname" . }}-collab
+                port:
+                  number: {{ .Values.service.port }}
+          - path: {{ .Values.collab.path }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "windyflo.fullname" . }}-collab
+                port:
+                  number: {{ .Values.service.port }}
+          {{- end }}
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "windyflo.fullname" . }}-main
+                port:
+                  number: {{ .Values.service.port }}
+{{- end }}

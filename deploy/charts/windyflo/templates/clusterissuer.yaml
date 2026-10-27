@@ -1,0 +1,27 @@
+{{- /* Let's Encrypt ClusterIssuer (ADR-0005). Only rendered when this chart bundles cert-manager
+       itself (operators.certManager.enabled) — the self-hosted path gets its issuer from the
+       sibling cluster-config chart instead and leaves this off.
+       helm.sh/hook (marketplace-bundling follow-up, 2026-08-24; see
+       templates/data/cnpg-cluster.yaml for the full rationale): cert-manager installs in the SAME
+       `helm install` as this CR, and its CRDs ship as a plain template — deferred via a
+       post-install hook so the ClusterIssuer kind is registered first. */ -}}
+{{- if .Values.clusterIssuer.enabled }}
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: {{ .Values.clusterIssuer.issuerName }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "10"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  acme:
+    server: {{ .Values.clusterIssuer.server }}
+    email: {{ .Values.clusterIssuer.email | quote }}
+    privateKeySecretRef:
+      name: {{ .Values.clusterIssuer.issuerName }}-account-key
+    solvers:
+      - http01:
+          ingress:
+            class: {{ .Values.ingress.className }}
+{{- end }}

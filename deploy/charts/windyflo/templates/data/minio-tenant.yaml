@@ -1,0 +1,94 @@
+{{- if and .Values.data.minio.embedded (not .Values.data.plain) }}
+{{- /* MinIO Operator Tenant CR (ADR-A1c). helm.sh/hook (ADR-0005 marketplace-bundling follow-up,
+       2026-08-24; see cnpg-cluster.yaml for the full rationale): on the bundled-operator profiles
+       the MinIO operator installs in the SAME `helm install` as this CR (subchart dependency, not
+       a helmfile pre-step), and its CRDs ship as a plain template — deferred via a post-install
+       hook so the Tenant kind is registered first. distributed mode = erasure-coded HA; standalone
+       (servers=1) = edge/local. */ -}}
+{{- $servers := .Values.data.minio.servers | int -}}
+{{- if eq .Values.data.minio.mode "standalone" }}{{- $servers = 1 }}{{- end -}}
+apiVersion: minio.min.io/v2
+kind: Tenant
+metadata:
+  name: {{ .Values.data.minio.name }}
+  labels:
+    {{- include "windyflo.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "10"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  # Pinned version (NOT :latest) — reproducible + air-gap mirrorable. Override per-env with data.minio.image.
+  image: {{ include "windyflo.azureImage" (dict "root" . "key" "minio" "fallback" .Values.data.minio.image) | quote }}
+  # No auto TLS in-cluster; front with the internal CA / ingress for external access (A7).
+  requestAutoCert: false
+  configuration:
+    name: {{ .Values.data.minio.name }}-config
+  pools:
+    - name: pool-0
+      servers: {{ $servers }}
+      volumesPerServer: {{ .Values.data.minio.volumesPerServer }}
+      {{- if eq .Values.data.minio.mode "distributed" }}
+      # HA: spread the erasure-set servers across nodes so a node loss drops at most one drive's
+      # worth of EC shards (quorum survives). Soft anti-affinity → still schedules if nodes < servers.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    v1.min.io/tenant: {{ .Values.data.minio.name }}
+      {{- end }}
+      {{- with .Values.data.minio.resources }}
+      # cpu+memory requests AND limits on the MinIO server pods (Marketplace cert requires limits on
+      # every workload; the data layer was previously unbounded).
+      resources:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumeClaimTemplate:
+        metadata:
+          name: data
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          {{- with .Values.data.minio.storageClass }}
+          storageClassName: {{ . }}
+          {{- end }}
+          resources:
+            requests:
+              storage: {{ .Values.data.minio.storageSize }}
+---
+{{- /* Root credentials for the Tenant. The APP uses a least-privilege user created by the
+       bootstrap Job below — root is only used by that Job. */}}
+{{- /* HA/prod guard: distributed mode (real deployments) MUST have strong root creds, EITHER
+       explicitly via secrets.extra.MINIO_ROOT_USER / MINIO_ROOT_PASSWORD OR generated via
+       secrets.autoGenerate=true (marketplace/turnkey — windyflo.minioRootPassword then derives a
+       release-scoped value, never the minioadmin123 default). Fail only when NEITHER is set, so
+       the guard still holds for any distributed-mode install — not just the three marketplace
+       profiles — instead of being unconditionally skipped whenever autoGenerate is true. */}}
+{{- if eq .Values.data.minio.mode "distributed" }}
+{{- if not (or .Values.secrets.extra.MINIO_ROOT_PASSWORD .Values.secrets.autoGenerate) }}
+{{- fail "data.minio.mode=distributed requires secrets.extra.MINIO_ROOT_PASSWORD (or set secrets.autoGenerate=true). Generate with: openssl rand -base64 24" }}
+{{- end }}
+{{- if not (or .Values.secrets.extra.MINIO_ROOT_USER .Values.secrets.autoGenerate) }}
+{{- fail "data.minio.mode=distributed requires secrets.extra.MINIO_ROOT_USER (or set secrets.autoGenerate=true)." }}
+{{- end }}
+{{- end }}
+{{- /* Root creds via the shared helper (ONE lookup) — same value the app Secret + bootstrap Job use. */}}
+{{- $minioCreds := include "windyflo.minioRootCreds" . | splitList "|" }}
+{{- $minioUser := first $minioCreds }}
+{{- $minioPass := last $minioCreds }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Values.data.minio.name }}-config
+  labels:
+    {{- include "windyflo.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  config.env: |-
+    export MINIO_ROOT_USER="{{ $minioUser }}"
+    export MINIO_ROOT_PASSWORD="{{ $minioPass }}"
+    export MINIO_BROWSER="on"
+{{- end }}

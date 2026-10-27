@@ -1,0 +1,112 @@
+{{- if and .Values.data.plain .Values.data.minio.embedded }}
+{{- /* Plain single-replica MinIO for marketplace deployers that cannot use operator CRDs or Helm hooks
+       (see data.plain in values.yaml). Service <name>-hl on :9000 keeps windyflo.s3Endpoint working;
+       the bucket is created by the container start command. */ -}}
+{{- $m := .Values.data.minio }}
+{{- $creds := include "windyflo.minioRootCreds" . | splitList "|" }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $m.name }}-root
+  labels:
+    {{- include "windyflo.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  MINIO_ROOT_USER: {{ first $creds | quote }}
+  MINIO_ROOT_PASSWORD: {{ last $creds | quote }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $m.name }}-hl
+  labels:
+    {{- include "windyflo.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/name: {{ $m.name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: s3
+      port: 9000
+      targetPort: s3
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $m.name }}
+  labels:
+    {{- include "windyflo.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  # Delete the PVCs with the StatefulSet: Marketplace uninstall must leave nothing behind
+  # ("Some resources were not deleted"), and PVCs are not covered by the Application's ownership.
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Delete
+    whenScaled: Retain
+  serviceName: {{ $m.name }}-hl
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $m.name }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ $m.name }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: minio
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: minio
+          image: {{ include "windyflo.azureImage" (dict "root" . "key" "minio" "fallback" $m.image) | quote }}
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          # The bucket is just a directory under /data in single-drive mode — create it before serving,
+          # so no mc/bootstrap Job (and no extra image) is needed. The app uses the root credentials.
+          command: ["/bin/sh", "-c", "mkdir -p /data/{{ $m.bucket }} && exec /usr/bin/minio server /data --address :9000 --console-address :9001"]
+          envFrom:
+            - secretRef:
+                name: {{ $m.name }}-root
+          ports:
+            - name: s3
+              containerPort: 9000
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: s3
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: s3
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          {{- with $m.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with $m.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $m.storageSize }}
+{{- end }}

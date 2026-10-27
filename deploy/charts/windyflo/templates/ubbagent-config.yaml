@@ -1,0 +1,48 @@
+{{- if .Values.gcpMarketplace.ubbagent.enabled }}
+{{- /*
+GCP Marketplace usage-reporting agent config (PAID GCP listing only).
+
+Consumed by the ubbagent sidecar (see windyflo.ubbagentContainer in _helpers.tpl). Defines one metric
+and reports it to Google Service Control, which is what Google bills the buyer against.
+
+The metric and service names are minted by the Marketplace team when the pricing model is submitted;
+they are NOT free-form. build-deployer.sh should refuse to package while they are still empty.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "windyflo.fullname" . }}-ubbagent
+  labels:
+    {{- include "windyflo.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    identities:
+      - name: gcp
+        gcp:
+          encodedServiceAccountKey: $AGENT_REPORTING_KEY
+
+    metrics:
+      - definition:
+          name: {{ .Values.gcpMarketplace.ubbagent.metricName | quote }}
+          type: int
+        endpoints:
+          - name: servicecontrol
+        # Aggregate locally so a burst of reports becomes one billing entry per minute.
+        aggregation:
+          bufferSeconds: 60
+
+    endpoints:
+      - name: servicecontrol
+        servicecontrol:
+          identity: gcp
+          serviceName: {{ .Values.gcpMarketplace.ubbagent.serviceName | quote }}
+          consumerId: $AGENT_REPORTING_CONSUMER_ID
+
+    sources:
+      - name: {{ .Values.gcpMarketplace.ubbagent.metricName | quote }}
+        heartbeat:
+          metric: {{ .Values.gcpMarketplace.ubbagent.metricName | quote }}
+          intervalSeconds: 3600
+          value:
+            int64Value: 1
+{{- end }}

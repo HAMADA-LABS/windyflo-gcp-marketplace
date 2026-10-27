@@ -1,0 +1,71 @@
+apiVersion: v2
+name: windyflo
+description: WindyFlo (main + worker) with an optional in-cluster, self-built HA data layer (Postgres via CloudNativePG, Redis Sentinel, MinIO). Single chart, air-gap baseline.
+type: application
+version: 3.1.4
+# WindyFlo app version this chart targets. Override image.tag per environment (digest-pin for prod/air-gap).
+appVersion: '3.1.4'
+kubeVersion: '>=1.27.0-0'
+home: https://windyflo.com
+icon: https://framerusercontent.com/images/32whvREluwuwL4ImBvgPdj6JgY.png # real image/png (the site favicon). NOT windyflo.com/icon.png: that path returns the Framer SPA 404 page (HTTP 200, text/html), which Marketplace review reports as "page not found". Also shipped as icon.png.
+maintainers:
+    - name: Hamada Labs
+
+# Redis HA is the one data-layer component with a maintained upstream chart, so it is a real
+# subchart dependency (toggled by data.redis.embedded). Postgres (CloudNativePG Cluster) and
+# MinIO (Tenant) are operator CRs templated directly under templates/data.
+#
+# The operators that provide those CRDs (CNPG, MinIO Operator, cert-manager, external-secrets) are
+# normally installed cluster-wide by helmfile BEFORE this chart (self-hosted path — all 4
+# operators.* flags below default false, unchanged). The Azure Marketplace profile flips them on:
+# a buyer's fresh AKS cluster gets only ONE `helm install` (this chart), so the operators must ship
+# as subchart dependencies instead (ADR-0005).
+dependencies:
+    - name: redis
+      version: 20.6.3
+      repository: oci://registry-1.docker.io/bitnamicharts
+      # First path found wins: data.redis.subchart (set false only by the plain/GCP profile, which runs
+      # its own Redis StatefulSet) else data.redis.embedded.
+      condition: data.redis.subchart,data.redis.embedded
+      alias: redis
+    - name: cloudnative-pg
+      version: 0.22.1
+      repository: https://cloudnative-pg.github.io/charts
+      condition: operators.cnpg.enabled
+      alias: cnpgOperator
+    - name: operator
+      version: 6.0.4
+      repository: https://operator.min.io
+      condition: operators.minioOperator.enabled
+      # alias MUST be lowercase (found 2026-08-24, same class of bug as cert-manager below): this
+      # chart's operator-deployment.yaml hardcodes its container name as raw `{{ .Chart.Name }}`,
+      # with no nameOverride escape hatch — a camelCase alias produces an invalid RFC 1123
+      # container name. Renamed to minio-operator (matches the real chart's install name); the
+      # values-key this chart's own files use to configure the subchart renamed to match:
+      # minioOperator: → minio-operator: (the operators.minioOperator.enabled TOGGLE above and the
+      # global.azure.images.minioOperator IMAGE-LOOKUP key are unrelated custom keys of ours, not
+      # Kubernetes object names — deliberately left camelCase, unchanged).
+      alias: minio-operator
+    - name: cert-manager
+      version: v1.16.2
+      repository: https://charts.jetstack.io
+      condition: operators.certManager.enabled
+      # alias MUST be lowercase (found 2026-08-24): cert-manager's own chart hardcodes several
+      # container names as raw `{{ .Chart.Name }}-<suffix>` (cainjector/webhook/controller/
+      # startupapicheck deployments) — .Chart.Name resolves to THIS alias inside the aliased
+      # subchart's render context, with no lowercasing and no nameOverride escape hatch (unlike
+      # object names via <chart>.fullname, which nameOverride does fix — see values.yaml). A
+      # camelCase alias here produces invalid RFC 1123 container names 100% of the time this
+      # subchart is enabled. The values-key this chart's own files use to configure the subchart
+      # renamed to match: certManager: → cert-manager:.
+      alias: cert-manager
+    - name: external-secrets
+      version: 0.10.7
+      repository: https://charts.external-secrets.io
+      condition: operators.externalSecrets.enabled
+      # Same class of bug as cert-manager above: external-secrets' main Deployment hardcodes its
+      # container name as raw `{{ .Chart.Name }}` (no nameOverride escape hatch). Aliased to the
+      # chart's own real name (already lowercase-with-hyphens) instead of a camelCase alias, so
+      # `.Chart.Name` resolves correctly with no rename needed elsewhere. Currently latent —
+      # operators.externalSecrets.enabled is false on every profile — fixed proactively.
+      alias: external-secrets

@@ -1,0 +1,42 @@
+{{- if and .Values.data.postgres.embedded (not .Values.data.plain) .Values.data.postgres.pooler.enabled }}
+{{- /* PgBouncer Pooler (transaction mode) — bounds backend connections across N app replicas
+       (ADR-A1a). App points DATABASE_HOST at <name>-pooler-rw (see windyflo.pgHost).
+       helm.sh/hook (see cnpg-cluster.yaml for the full rationale): same CRD-not-yet-registered
+       issue on the bundled-operator profiles, plus this CR references the Cluster by name — weight
+       20 orders it strictly after the Cluster's own hook (weight 10). */ -}}
+apiVersion: postgresql.cnpg.io/v1
+kind: Pooler
+metadata:
+  name: {{ .Values.data.postgres.name }}-pooler-rw
+  labels:
+    {{- include "windyflo.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "20"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  cluster:
+    name: {{ .Values.data.postgres.name }}
+  instances: {{ .Values.data.postgres.pooler.instances }}
+  type: rw
+  pgbouncer:
+    poolMode: {{ .Values.data.postgres.pooler.poolMode }}
+  {{- /* Bound the PgBouncer pods (Marketplace cert requires cpu+memory limits on every workload)
+         and/or pin the pgbouncer image to the Marketplace registry — CNPG's Pooler CRD otherwise
+         defaults to an external registry image. CNPG injects this PodTemplateSpec onto the pooler
+         Deployment; the container name MUST be "pgbouncer". */ -}}
+  {{- $poolerImage := include "windyflo.azureImage" (dict "root" . "key" "pgbouncer" "fallback" .Values.data.postgres.pooler.image) }}
+  {{- if or .Values.data.postgres.pooler.image .Values.data.postgres.pooler.resources (index .Values.global.azure.images "pgbouncer") }}
+  template:
+    spec:
+      containers:
+        - name: pgbouncer
+          {{- if $poolerImage }}
+          image: {{ $poolerImage | quote }}
+          {{- end }}
+          {{- with .Values.data.postgres.pooler.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+  {{- end }}
+{{- end }}

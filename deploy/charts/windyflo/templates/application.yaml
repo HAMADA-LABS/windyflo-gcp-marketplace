@@ -1,0 +1,102 @@
+{{- /*
+  GCP Marketplace requires every Kubernetes app to deploy an `Application` custom resource (the
+  App SIG proposal CRD — https://github.com/kubernetes-sigs/application). Cloud Marketplace reads
+  this resource to render the "Application details" page a buyer sees after clicking Deploy
+  (name, version, descriptor, links to owned components). It is a no-op outside GCP Marketplace,
+  so it's gated behind gcpMarketplace.enabled — the CRD must already exist in the target cluster
+  (GKE Marketplace installs it automatically; other environments don't have it and don't need it).
+
+  componentKinds/selector coverage: the CNPG Cluster and MinIO Tenant CRs carry windyflo.labels on
+  their OWN metadata (same name+instance as the Deployments below), so they're included here and do
+  get discovered. Their operator-managed child Pods/StatefulSets do NOT inherit those labels (CNPG
+  stamps its own cnpg.io/cluster scheme, MinIO Operator stamps v1.min.io/tenant) — that's an
+  upstream-operator limitation, not something this selector can reach. The bitnami Redis subchart
+  is NOT listed: it's a third-party chart with its own label scheme entirely disconnected from
+  windyflo.labels, so no selector here can match it without patching the subchart's templates.
+*/ -}}
+{{- if .Values.gcpMarketplace.enabled }}
+{{- /*
+  The Marketplace deployer runs validate_app_resource.py on EVERY install (not just certification)
+  and throws before applying anything unless all of the following hold. Fail at render time instead
+  — a bad deployer image only surfaces inside the buyer's cluster, which is the worst place to find out.
+*/ -}}
+{{- $publishedVersion := .Values.gcpMarketplace.publishedVersion | default (include "windyflo.appVersion" .) -}}
+{{- if not (regexMatch `^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)([-+].*)?$` $publishedVersion) -}}
+{{- fail (printf "gcpMarketplace.publishedVersion %q is not strict SemVer with a patch component (the deployer's SEMVER_RE rejects e.g. \"3.0\")" $publishedVersion) -}}
+{{- end -}}
+{{- if not .Values.gcpMarketplace.partnerId -}}
+{{- fail "gcpMarketplace.partnerId is required when gcpMarketplace.enabled: the deployer rejects an Application whose marketplace.cloud.google.com/deploy-info JSON has no partner_id" -}}
+{{- end -}}
+{{- if not .Values.gcpMarketplace.productId -}}
+{{- fail "gcpMarketplace.productId is required when gcpMarketplace.enabled: the deployer rejects an Application whose marketplace.cloud.google.com/deploy-info JSON has no product_id" -}}
+{{- end -}}
+apiVersion: app.k8s.io/v1beta1
+kind: Application
+metadata:
+  {{- /* MUST equal .Release.Name (the deployer's NAME): the Marketplace deployer pre-creates an
+         Application with that name, and after applying the manifests it reads
+         .spec.descriptor.version from IT. A differently named Application leaves that one blank and
+         the deployer fails with "Application's version 'null' does not match publishedVersion". */}}
+  name: {{ .Release.Name }}
+  annotations:
+    {{- /* REQUIRED. Must be valid JSON (quoted keys) containing partner_id + product_id, and both must
+           match the identifiers on the Producer Portal listing. */}}
+    marketplace.cloud.google.com/deploy-info: {{ dict "partner_id" .Values.gcpMarketplace.partnerId "product_id" .Values.gcpMarketplace.productId "partner_name" .Values.gcpMarketplace.partnerName | toJson | quote }}
+    {{- /* Marketplace renders this on the app-details page. Google asks for a 200x200 PNG inlined as a
+           data: URI (not bare base64). Kept small deliberately — this lands in an API object. */}}
+    kubernetes-engine.cloud.google.com/icon: >-
+      data:image/png;base64,{{ .Files.Get "icon.png" | b64enc }}
+  labels:
+    {{- include "windyflo.labels" . | nindent 4 }}
+spec:
+  descriptor:
+    type: windyflo
+    {{- /* MUST equal schema.yaml's x-google-marketplace.publishedVersion, string-compared. */}}
+    version: {{ $publishedVersion | quote }}
+    description: {{ .Chart.Description | quote }}
+    maintainers:
+      - name: Hamada Labs
+        url: https://windyflo.com
+    owners:
+      - name: Hamada Labs
+        url: https://windyflo.com
+    keywords: ['ai', 'agent-builder', 'workflow', 'automation']
+    links:
+      - description: Documentation
+        url: https://windyflo.com/user-guide/how-to-build-pipelines
+  componentKinds:
+    {{- /* The deployer's set_ownership.py gives the Application ownership of a resource ONLY if its
+           kind is listed here. Anything unlisted is orphaned on uninstall, and the Marketplace test
+           fails with "Some resources were not deleted". Keep this in sync with every kind the chart
+           renders (PVCs are not rendered: the StatefulSets delete them, see
+           persistentVolumeClaimRetentionPolicy in data/plain-*.yaml). */}}
+    - group: apps/v1
+      kind: Deployment
+    - group: apps/v1
+      kind: StatefulSet
+    - group: v1
+      kind: Service
+    - group: v1
+      kind: Secret
+    - group: v1
+      kind: ConfigMap
+    - group: v1
+      kind: ServiceAccount
+    - group: networking.k8s.io/v1
+      kind: Ingress
+    - group: networking.k8s.io/v1
+      kind: NetworkPolicy
+    - group: policy/v1
+      kind: PodDisruptionBudget
+    - group: autoscaling/v2
+      kind: HorizontalPodAutoscaler
+    {{- if not .Values.data.plain }}
+    - group: postgresql.cnpg.io
+      kind: Cluster
+    - group: minio.min.io
+      kind: Tenant
+    {{- end }}
+  selector:
+    matchLabels:
+      {{- include "windyflo.selectorLabels" . | nindent 6 }}
+{{- end }}
